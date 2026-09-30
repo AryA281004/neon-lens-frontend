@@ -1,0 +1,134 @@
+name: FRONTEND BUILD
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: frontend-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # BUILD FRONTEND
+  # ============================================================
+  build:
+    name: Build Neon Lens Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    environment:
+      name: production
+
+    permissions:
+      contents: read
+
+    steps:
+      # ------------------------------------------------------------
+      # CHECKOUT
+      # ------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # SETUP NODE
+      # ------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # ------------------------------------------------------------
+      # INSTALL DEPENDENCIES
+      # ------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          echo "Installing frontend dependencies..."
+          npm ci
+          echo ""
+          echo "Dependencies installed successfully."
+
+      # ------------------------------------------------------------
+      # LINT
+      # ------------------------------------------------------------
+      - name: Run ESLint
+        run: |
+          echo "Running ESLint..."
+          npm run lint
+          echo ""
+          echo "Lint passed successfully."
+
+      # ------------------------------------------------------------
+      # BUILD
+      # ------------------------------------------------------------
+      - name: Build frontend
+        run: |
+          echo "=============================================="
+          echo "Building Neon Lens Frontend"
+          echo "=============================================="
+          echo "Commit: ${{ github.sha }}"
+          echo ""
+          npm run build
+          echo ""
+          echo "Frontend build completed successfully."
+
+      # ------------------------------------------------------------
+      # VERIFY BUILD
+      # ------------------------------------------------------------
+      - name: Verify build output
+        run: |
+          echo "Checking build output..."
+          test -f dist/index.html
+          echo ""
+          echo "Build output verified."
+          echo ""
+          echo "Build size:"
+          du -sh dist
+
+      # ------------------------------------------------------------
+      # UPLOAD BUILD ARTIFACT
+      # ------------------------------------------------------------
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # ------------------------------------------------------------
+      # BUILD SUMMARY
+      # ------------------------------------------------------------
+      - name: Build summary
+        run: |
+          echo "=============================================="
+          echo "Neon Lens Frontend Build Successful"
+          echo "=============================================="
+          echo "Commit   : ${{ github.sha }}"
+          echo "Artifact : frontend-dist-${{ github.sha }}"
+          echo "=============================================="
+
+      # ------------------------------------------------------------
+      # SLACK NOTIFICATION (SUCCESS + FAILURE)
+      # ------------------------------------------------------------
+      - name: Slack Notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_BUILD }}
+          SLACK_COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}
+          SLACK_TITLE: ${{ job.status == 'success' && 'Frontend Build Successful' || 'Frontend Build Failed' }}
+          SLACK_MESSAGE: |
+            ${{ job.status == 'success' && '✅ Neon Lens Frontend Build Successful' || '❌ Neon Lens Frontend Build Failed' }}
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_FOOTER: "Neon-Lens Frontend CI"
