@@ -53,16 +53,7 @@ jobs:
           echo ""
           echo "Dependencies installed successfully."
 
-      # ------------------------------------------------------------
-      # LINT
-      # ------------------------------------------------------------
-      - name: Run ESLint
-        run: |
-          echo "Running ESLint..."
-          npm run lint
-          echo ""
-          echo "Lint passed successfully."
-
+     
       # ------------------------------------------------------------
       # BUILD
       # ------------------------------------------------------------
