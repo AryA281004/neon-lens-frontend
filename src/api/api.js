@@ -1,6 +1,6 @@
 import axios from "axios";
 
-const API_BASE_URL = process.env.BACKEND_URL || "https://api.aryandudhat.qd.je/api"; // Default to localhost if not set
+const API_BASE_URL = import.meta.env.BACKEND_URL || "https://api.aryandudhat.qd.je/api"; // Default to localhost if not set
 
 // 🔐 Create axios instance with interceptors
 const apiClient = axios.create({
