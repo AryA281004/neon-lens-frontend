@@ -467,9 +467,9 @@ export const editUserName = async (newUsername) => {
       username: newUsername,
     });
 
-    ```
+ 
 return response.data;
-```;
+
   } catch (error) {
     const message =
       error?.response?.data?.message || error?.message || "Network error";
@@ -483,9 +483,9 @@ export const editFirstName = async (newFirstName) => {
       firstName: newFirstName,
     });
 
-    ```
+   
 return response.data;
-```;
+
   } catch (error) {
     const message =
       error?.response?.data?.message || error?.message || "Network error";
@@ -499,9 +499,9 @@ export const editLastName = async (newLastName) => {
       lastName: newLastName,
     });
 
-    ```
+  
 return response.data;
-```;
+
   } catch (error) {
     const message =
       error?.response?.data?.message || error?.message || "Network error";
@@ -515,9 +515,9 @@ export const editBio = async (newBio) => {
       bio: newBio,
     });
 
-    ```
+    
 return response.data;
-```;
+
   } catch (error) {
     const message =
       error?.response?.data?.message || error?.message || "Network error";
@@ -554,9 +554,9 @@ export const editEquipment = async (equipment) => {
       equipment,
     });
 
-    ```
+    
 return response.data;
-```;
+
   } catch (error) {
     const message =
       error?.response?.data?.message || error?.message || "Network error";
@@ -574,9 +574,9 @@ export const sendContactMessage = async (name, email, subject, message) => {
       message,
     });
 
-    ```
+   
 return response.data.message;
-```;
+
   } catch (error) {
     const message =
       error?.response?.data?.message || error?.message || "Network error";
@@ -595,9 +595,8 @@ export const refreshAccessToken = async () => {
       },
     );
 
-    ```
+    
 return response.data;
-```;
   } catch (error) {
     // If refresh fails, logout user
     localStorage.removeItem("user");
