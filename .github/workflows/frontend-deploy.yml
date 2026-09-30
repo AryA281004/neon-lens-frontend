@@ -122,6 +122,51 @@ jobs:
           test -f dist/index.html
 
 
+      - name: Debug GitHub OIDC claims
+        shell: bash
+        run: |
+          echo "Requesting GitHub OIDC token..."
+
+          OIDC_TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            | jq -r '.value')
+
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "ERROR: Failed to obtain OIDC token"
+            exit 1
+          fi
+
+          echo "OIDC token received."
+
+          PAYLOAD=$(echo "$OIDC_TOKEN" | cut -d '.' -f 2)
+
+          # Add padding required by base64
+          case $((${#PAYLOAD} % 4)) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+          esac
+
+          echo ""
+          echo "=============================================="
+          echo "GitHub OIDC Claims"
+          echo "=============================================="
+
+          echo "$PAYLOAD" \
+            | base64 -d 2>/dev/null \
+            | jq '{
+                iss,
+                sub,
+                aud,
+                repository,
+                repository_owner,
+                ref,
+                environment
+              }'
+
+          echo "=============================================="
+
+
       # ========================================================
       # CONFIGURE AWS
       # ========================================================
