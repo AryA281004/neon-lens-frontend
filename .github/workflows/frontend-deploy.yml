@@ -6,7 +6,6 @@ on:
       - "FRONTEND BUILD"
     types:
       - completed
-      - completed
   workflow_dispatch:
 
 permissions:
@@ -16,6 +15,88 @@ permissions:
 
 jobs:
 
+   # ============================================================
+  # RESOLVE SOURCE ENVIRONMENT AND COMMIT
+  # ============================================================
+  resolve-source:
+    name: Resolve Build Environment and Commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.name == 'FRONTEND BUILD' &&
+          github.event.workflow_run.event == 'workflow_dispatch' &&
+          github.event.workflow_run.conclusion == 'success'
+        )
+      }}
+
+    permissions:
+      actions: read
+      contents: read
+
+    outputs:
+      source_branch: ${{ steps.source.outputs.branch }}
+      source_commit: ${{ steps.source.outputs.commit }}
+
+    steps:
+      # ------------------------------------------------------------
+      # DOWNLOAD METADATA FOR AUTOMATIC DEPLOYMENT
+      # ------------------------------------------------------------
+      - name: Download deployment metadata
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-metadata-${{ github.event.workflow_run.id }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: deployment-metadata
+
+      # ------------------------------------------------------------
+      # RESOLVE AND VALIDATE SOURCE
+      # ------------------------------------------------------------
+      - name: Resolve source branch and commit
+        id: source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_BRANCH: ${{ github.ref_name }}
+          MANUAL_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            test -f deployment-metadata/metadata.json
+
+            SOURCE_BRANCH="$(jq -er '.branch' deployment-metadata/metadata.json)"
+            SOURCE_COMMIT="$(jq -er '.commit' deployment-metadata/metadata.json)"
+          else
+            SOURCE_BRANCH="$MANUAL_BRANCH"
+            SOURCE_COMMIT="$MANUAL_COMMIT"
+          fi
+
+          case "$SOURCE_BRANCH" in
+            dev|pre|prod) ;;
+            *)
+              echo "::error::Unsupported source environment: $SOURCE_BRANCH"
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid source commit SHA: $SOURCE_COMMIT"
+            exit 1
+          fi
+
+          echo "branch=$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved environment: $SOURCE_BRANCH"
+          echo "Resolved commit: $SOURCE_COMMIT"
+
   # ============================================================
   # DEPLOY TO S3 + CLOUDFRONT
   # ============================================================
@@ -23,15 +104,12 @@ jobs:
   deploy:
     name: Deploy Frontend to S3 + CloudFront
 
-    if: >-
-      ${{
-        (github.event_name == 'workflow_run' &&
-         github.event.workflow_run.conclusion == 'success' &&
-         contains(fromJSON('["dev","pre","prod"]'), github.event.workflow_run.head_branch))||(github.event_name == 'workflow_dispatch' && contains(fromJSON('["dev","pre","prod"]'), github.ref_name))
-      }}
+    needs: resolve-source
+
+    if: ${{ needs.resolve-source.result == 'success' }}
 
     environment:
-      name: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+      name: ${{ needs.resolve-source.outputs.source_branch }}
 
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -42,25 +120,18 @@ jobs:
       # SET DEPLOYMENT VARIABLES
       # ========================================================
 
+      
       - name: Set deployment variables
         id: deployment
         shell: bash
         env:
-          SOURCE_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
-          WORKFLOW_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          MANUAL_SOURCE_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: ${{ needs.resolve-source.outputs.source_branch }}
+          SOURCE_COMMIT: ${{ needs.resolve-source.outputs.source_commit }}
+          SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
           FRONTEND_BUCKET_NAME: ${{ secrets.FRONTEND_BUCKET_NAME }}
           DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
         run: |
           set -euo pipefail
-
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
-            SOURCE_COMMIT="$WORKFLOW_SOURCE_SHA"
-            SOURCE_RUN_ID="${{ github.event.workflow_run.id }}"
-          else
-            SOURCE_COMMIT="$MANUAL_SOURCE_SHA"
-            SOURCE_RUN_ID=""
-          fi
 
           if [[ -z "$FRONTEND_BUCKET_NAME" || -z "$DISTRIBUTION_ID" ]]; then
             echo "::error::Missing S3 bucket or CloudFront distribution secret for $SOURCE_BRANCH."
@@ -136,11 +207,12 @@ jobs:
       # DOWNLOAD BUILD ARTIFACT
       # ========================================================
 
+      
       - name: Download frontend build artifact
         if: ${{ github.event_name == 'workflow_run' }}
         uses: actions/github-script@v7
         env:
-          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_COMMIT: ${{ needs.resolve-source.outputs.source_commit }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         with:
           script: |
@@ -161,8 +233,8 @@ jobs:
 
             if (!artifact) {
               core.setFailed(
-                `Frontend artifact not found for commit ${commit}. ` +
-                `Ensure FRONTEND BUILD uses the same branch and commit as this deployment.`
+                `Frontend artifact not found for selected commit ${commit}. ` +
+                `Check the build run and its uploaded artifacts.`
               );
               return;
             }
@@ -180,6 +252,7 @@ jobs:
             );
 
             console.log(`Downloaded artifact: ${artifact.name}`);
+
 
       # ========================================================
       # BUILD FRONTEND FOR MANUAL DEPLOYMENT
@@ -361,60 +434,227 @@ jobs:
           echo "CloudFront ID : $CLOUDFRONT_DISTRIBUTION_ID"
           echo "=============================================="
 
-  # ============================================================
-  # SLACK SUCCESS
-  # ============================================================
+  
+      # ============================================
+      # SLACK NOTIFICATIONS
+      # ============================================
 
-  slack-success:
-    name: Notify Slack - Success
+      - name: Notify Slack — Deployment Successful
+        if: ${{ success() }}
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🚀 Neon Lens Frontend Deployment Successful",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚀 Neon Lens | Deployment Successful",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "The Neon Lens frontend deployment pipeline completed successfully. The S3 synchronization and CloudFront invalidation steps have passed."
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*📦 Application*\nNeon Lens Frontend"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🟢 Status*\nSUCCESS"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🌍 Environment*\n`${{ needs.resolve-source.outputs.source_branch }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*☁️ AWS Region*\n`${{ env.AWS_REGION }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🪣 S3 Bucket*\n`${{ env.S3_BUCKET }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🌐 CloudFront Distribution*\n`${{ env.CLOUDFRONT_DISTRIBUTION_ID }}`"
+                    }
+                  ]
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*🔎 Source Information*\n*Branch:* `${{ needs.resolve-source.outputs.source_branch }}`\n*Commit:* `${{ needs.resolve-source.outputs.source_commit }}`\n*Triggered by:* `${{ github.actor }}`\n*Run number:* `${{ github.run_number }}`"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*✅ Deployment Checklist*\n• Frontend build artifact retrieved\n• AWS credentials configured\n• Frontend files synchronized to S3\n• CloudFront invalidation submitted"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Deployment Run",
+                        "emoji": true
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "style": "primary"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Source Commit",
+                        "emoji": true
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/commit/${{ needs.resolve-source.outputs.source_commit }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Neon Lens CI/CD | GitHub Actions | AWS S3 | Amazon CloudFront"
+                    }
+                  ]
+                }
+              ]
+            }
 
-    needs:
-      - deploy
-
-    if: ${{ always() && needs.deploy.result == 'success' }}
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Slack Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
-          SLACK_COLOR: good
-          SLACK_MESSAGE: |
-            Neon Lens Frontend deployment completed successfully.
-
-            Environment: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
-            Commit: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SLACK_FOOTER: "Neon-Lens (Frontend) - S3 + CloudFront Deployment"
-
-  # ============================================================
-  # SLACK FAILURE
-  # ============================================================
-
-  slack-failure:
-    name: Notify Slack - Failure
-
-    needs:
-      - deploy
-
-    if: ${{ always() && needs.deploy.result == 'failure' }}
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Slack Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
-          SLACK_COLOR: danger
-          SLACK_MESSAGE: |
-            Neon Lens Frontend deployment FAILED.
-
-            Environment: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
-            Commit: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SLACK_FOOTER: "Neon-Lens (Frontend) - S3 + CloudFront Deployment"
+      - name: Notify Slack — Deployment Failed
+        if: ${{ failure() }}
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🚨 Neon Lens Frontend Deployment Failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚨 Neon Lens | Deployment Failed",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "The Neon Lens frontend deployment pipeline failed. Review the workflow logs to identify the failing step before retrying."
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*📦 Application*\nNeon Lens Frontend"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🔴 Status*\nFAILED"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🌍 Environment*\n`${{ needs.resolve-source.outputs.source_branch }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*☁️ AWS Region*\n`${{ env.AWS_REGION }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*👤 Triggered by*\n`${{ github.actor }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🔢 Run Number*\n`${{ github.run_number }}`"
+                    }
+                  ]
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*🔎 Source Information*\n*Branch:* `${{ needs.resolve-source.outputs.source_branch }}`\n*Commit:* `${{ needs.resolve-source.outputs.source_commit }}`"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*🛠️ Troubleshooting Checklist*\n• Open the failed workflow run and identify the first failing step\n• Verify the environment's S3 bucket and CloudFront secrets\n• Check AWS credentials and IAM permissions\n• Confirm the frontend build artifact exists and is valid\n• Check the S3 sync and CloudFront invalidation logs"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Investigate Failed Run",
+                        "emoji": true
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "style": "danger"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Inspect Source Commit",
+                        "emoji": true
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/commit/${{ needs.resolve-source.outputs.source_commit }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Neon Lens CI/CD | Failure alert | Investigate before retrying"
+                    }
+                  ]
+                }
+              ]
+            }

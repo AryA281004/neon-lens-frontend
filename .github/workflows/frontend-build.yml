@@ -149,6 +149,42 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+          
+      # ------------------------------------------------------------
+      # CREATE DEPLOYMENT METADATA
+      # ------------------------------------------------------------
+      - name: Create deployment metadata
+        env:
+          TARGET_BRANCH: ${{ inputs.branch }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p deployment-metadata
+
+          jq -n \
+            --arg branch "$TARGET_BRANCH" \
+            --arg commit "$SOURCE_COMMIT" \
+            '{
+              branch: $branch,
+              commit: $commit
+            }' > deployment-metadata/metadata.json
+
+          cat deployment-metadata/metadata.json
+
+      # ------------------------------------------------------------
+      # UPLOAD DEPLOYMENT METADATA
+      # ------------------------------------------------------------
+      - name: Upload deployment metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-metadata-${{ github.run_id }}
+          path: deployment-metadata/metadata.json
+          if-no-files-found: error
+          retention-days: 7
+
+
       # ------------------------------------------------------------
       # BUILD SUMMARY
       # ------------------------------------------------------------
