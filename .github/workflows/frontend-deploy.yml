@@ -6,9 +6,13 @@ on:
       - "FRONTEND BUILD"
     types:
       - completed
+      - completed
+  workflow_dispatch:
 
-env:
-  AWS_REGION: us-east-1
+permissions:
+  contents: read
+  actions: read
+  id-token: write
 
 jobs:
 
@@ -19,24 +23,18 @@ jobs:
   deploy:
     name: Deploy Frontend to S3 + CloudFront
 
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      ${{
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         contains(fromJSON('["dev","pre","prod"]'), github.event.workflow_run.head_branch))||(github.event_name == 'workflow_dispatch' && contains(fromJSON('["dev","pre","prod"]'), github.ref_name))
+      }}
 
     environment:
-      name: production
+      name: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
 
     runs-on: ubuntu-latest
-
     timeout-minutes: 20
-
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-
-    env:
-      AWS_REGION: us-east-1
-      S3_BUCKET: ${{ secrets.FRONTEND_BUCKET_NAME }}
-      CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
 
     steps:
 
@@ -45,107 +43,225 @@ jobs:
       # ========================================================
 
       - name: Set deployment variables
+        id: deployment
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+          WORKFLOW_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          MANUAL_SOURCE_SHA: ${{ github.sha }}
+          FRONTEND_BUCKET_NAME: ${{ secrets.FRONTEND_BUCKET_NAME }}
+          DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
         run: |
-          SOURCE_COMMIT="${{ github.event.workflow_run.head_sha }}"
+          set -euo pipefail
 
-          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            SOURCE_COMMIT="$WORKFLOW_SOURCE_SHA"
+            SOURCE_RUN_ID="${{ github.event.workflow_run.id }}"
+          else
+            SOURCE_COMMIT="$MANUAL_SOURCE_SHA"
+            SOURCE_RUN_ID=""
+          fi
+
+          if [[ -z "$FRONTEND_BUCKET_NAME" || -z "$DISTRIBUTION_ID" ]]; then
+            echo "::error::Missing S3 bucket or CloudFront distribution secret for $SOURCE_BRANCH."
+            exit 1
+          fi
+
+          case "$SOURCE_BRANCH" in
+            dev)
+              AWS_REGION="eu-west-1"
+              ;;
+            pre)
+              AWS_REGION="us-east-2"
+              ;;
+            prod)
+              AWS_REGION="us-east-1"
+              ;;
+            *)
+              echo "::error::Unsupported deployment branch: $SOURCE_BRANCH"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "SOURCE_BRANCH=$SOURCE_BRANCH"
+            echo "SOURCE_COMMIT=$SOURCE_COMMIT"
+            echo "SOURCE_RUN_ID=$SOURCE_RUN_ID"
+            echo "AWS_REGION=$AWS_REGION"
+            echo "S3_BUCKET=$FRONTEND_BUCKET_NAME"
+            echo "CLOUDFRONT_DISTRIBUTION_ID=$DISTRIBUTION_ID"
+          } >> "$GITHUB_ENV"
 
           echo "=============================================="
           echo "Neon Lens Frontend Deployment"
           echo "=============================================="
+          echo "Environment   : $SOURCE_BRANCH"
           echo "Source commit : $SOURCE_COMMIT"
-          echo "S3 bucket     : $S3_BUCKET"
-          echo "CloudFront    : $CLOUDFRONT_DISTRIBUTION_ID"
+          echo "AWS region    : $AWS_REGION"
+          echo "S3 bucket     : $FRONTEND_BUCKET_NAME"
+          echo "CloudFront    : $DISTRIBUTION_ID"
           echo "=============================================="
 
+      # ========================================================
+      # CHECKOUT SOURCE COMMIT
+      # ========================================================
+
+      - name: Checkout source commit
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      # ========================================================
+      # RECORD CHECKED-OUT COMMIT
+      # ========================================================
+
+      - name: Verify checked-out commit
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+
+          if [[ "$ACTUAL_COMMIT" != "$SOURCE_COMMIT" ]]; then
+            echo "::error::Checked-out commit does not match the deployment commit."
+            exit 1
+          fi
+
+          echo "Verified commit: $ACTUAL_COMMIT"
 
       # ========================================================
       # DOWNLOAD BUILD ARTIFACT
       # ========================================================
 
       - name: Download frontend build artifact
+        if: ${{ github.event_name == 'workflow_run' }}
         uses: actions/github-script@v7
+        env:
+          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         with:
           script: |
-            const runId = context.payload.workflow_run.id;
+            const fs = require('fs');
 
-            const artifacts =
-              await github.rest.actions.listWorkflowRunArtifacts({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: runId
-              });
+            const runId = Number(process.env.SOURCE_RUN_ID);
+            const commit = process.env.SOURCE_COMMIT;
 
-            const artifact = artifacts.data.artifacts.find(
-              artifact =>
-                artifact.name === `frontend-dist-${context.payload.workflow_run.head_sha}`
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+
+            const artifact = artifacts.data.artifacts.find(item =>
+              item.name === `frontend-dist-${commit}` && !item.expired
             );
 
             if (!artifact) {
               core.setFailed(
-                `Frontend artifact not found for commit ${context.payload.workflow_run.head_sha}`
+                `Frontend artifact not found for commit ${commit}. ` +
+                `Ensure FRONTEND BUILD uses the same branch and commit as this deployment.`
               );
               return;
             }
 
-            const download =
-              await github.rest.actions.downloadArtifact({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                artifact_id: artifact.id,
-                archive_format: 'zip'
-              });
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: artifact.id,
+              archive_format: 'zip'
+            });
 
-            require('fs').writeFileSync(
+            fs.writeFileSync(
               'frontend-artifact.zip',
               Buffer.from(download.data)
             );
 
             console.log(`Downloaded artifact: ${artifact.name}`);
 
+      # ========================================================
+      # BUILD FRONTEND FOR MANUAL DEPLOYMENT
+      # ========================================================
+
+      - name: Setup Node.js
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm ci
+
+      - name: Build frontend
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          echo "Building environment: $TARGET_BRANCH"
+          echo "Commit: $SOURCE_COMMIT"
+
+          npm run build
 
       # ========================================================
       # EXTRACT ARTIFACT
       # ========================================================
 
       - name: Extract frontend artifact
+        if: ${{ github.event_name == 'workflow_run' }}
         run: |
+          set -euo pipefail
+
           echo "Extracting frontend build..."
-
           mkdir -p dist
-
           unzip -q frontend-artifact.zip -d dist
+          test -f dist/index.html
 
           echo ""
-          echo "Frontend artifact extracted."
+          echo "Frontend artifact extracted successfully."
+          du -sh dist
+
+      # ========================================================
+      # VERIFY BUILD OUTPUT
+      # ========================================================
+
+      - name: Verify build output
+        run: |
+          set -euo pipefail
 
           test -f dist/index.html
 
+          echo "Frontend build output verified."
+          du -sh dist
+
+      # ========================================================
+      # DEBUG GITHUB OIDC CLAIMS
+      # ========================================================
 
       - name: Debug GitHub OIDC claims
         shell: bash
         run: |
+          set -euo pipefail
+
           echo "Requesting GitHub OIDC token..."
 
-          OIDC_TOKEN=$(curl -sS \
+          OIDC_TOKEN=$(curl -fsS \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
             | jq -r '.value')
 
-          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
-            echo "ERROR: Failed to obtain OIDC token"
+          if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
+            echo "::error::Failed to obtain OIDC token."
             exit 1
           fi
 
-          echo "OIDC token received."
-
           PAYLOAD=$(echo "$OIDC_TOKEN" | cut -d '.' -f 2)
-
-          # Add padding required by base64
-          case $((${#PAYLOAD} % 4)) in
-            2) PAYLOAD="${PAYLOAD}==" ;;
-            3) PAYLOAD="${PAYLOAD}=" ;;
-          esac
+          PAYLOAD="${PAYLOAD}$(printf '%*s' "$(( (4 - ${#PAYLOAD} % 4) % 4 ))" '' | tr ' ' '=')"
 
           echo ""
           echo "=============================================="
@@ -166,7 +282,6 @@ jobs:
 
           echo "=============================================="
 
-
       # ========================================================
       # CONFIGURE AWS
       # ========================================================
@@ -178,20 +293,18 @@ jobs:
           role-to-assume: arn:aws:iam::666729139368:role/github
           role-session-name: github-actions-frontend-deploy
 
-
       # ========================================================
       # VERIFY AWS ACCESS
       # ========================================================
 
       - name: Verify AWS identity
         run: |
+          set -euo pipefail
+
           echo "Verifying AWS identity..."
-
           aws sts get-caller-identity
-
           echo ""
           echo "AWS credentials configured successfully."
-
 
       # ========================================================
       # DEPLOY TO S3
@@ -199,9 +312,12 @@ jobs:
 
       - name: Deploy frontend to S3
         run: |
+          set -euo pipefail
+
           echo "=============================================="
           echo "Uploading frontend to S3"
           echo "=============================================="
+          echo "Environment: $SOURCE_BRANCH"
           echo "Bucket: $S3_BUCKET"
           echo ""
 
@@ -212,16 +328,13 @@ jobs:
           echo ""
           echo "Frontend uploaded to S3 successfully."
 
-
       # ========================================================
       # CLOUDFRONT INVALIDATION
       # ========================================================
 
       - name: Invalidate CloudFront cache
         run: |
-          echo "=============================================="
-          echo "Creating CloudFront invalidation"
-          echo "=============================================="
+          set -euo pipefail
 
           INVALIDATION_ID=$(aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
@@ -230,10 +343,7 @@ jobs:
             --output text)
 
           echo "Invalidation ID: $INVALIDATION_ID"
-
-          echo ""
           echo "CloudFront invalidation created successfully."
-
 
       # ========================================================
       # DEPLOYMENT SUMMARY
@@ -244,11 +354,12 @@ jobs:
           echo "=============================================="
           echo "Neon Lens Frontend Deployment Successful"
           echo "=============================================="
+          echo "Environment   : $SOURCE_BRANCH"
           echo "Commit        : $SOURCE_COMMIT"
+          echo "AWS region    : $AWS_REGION"
           echo "S3 bucket     : $S3_BUCKET"
           echo "CloudFront ID : $CLOUDFRONT_DISTRIBUTION_ID"
           echo "=============================================="
-
 
   # ============================================================
   # SLACK SUCCESS
@@ -260,7 +371,7 @@ jobs:
     needs:
       - deploy
 
-    if: ${{ needs.deploy.result == 'success' }}
+    if: ${{ always() && needs.deploy.result == 'success' }}
 
     runs-on: ubuntu-latest
 
@@ -271,9 +382,13 @@ jobs:
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
           SLACK_COLOR: good
-          SLACK_MESSAGE: "Neon Lens Frontend deployment completed successfully. Commit: ${{ github.event.workflow_run.head_sha }}"
-          SLACK_FOOTER: "Neon-Lens (Frontend) - S3 + CloudFront Deployment"
+          SLACK_MESSAGE: |
+            Neon Lens Frontend deployment completed successfully.
 
+            Environment: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+            Commit: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_FOOTER: "Neon-Lens (Frontend) - S3 + CloudFront Deployment"
 
   # ============================================================
   # SLACK FAILURE
@@ -285,7 +400,7 @@ jobs:
     needs:
       - deploy
 
-    if: ${{ needs.deploy.result == 'failure' }}
+    if: ${{ always() && needs.deploy.result == 'failure' }}
 
     runs-on: ubuntu-latest
 
@@ -296,6 +411,10 @@ jobs:
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_DEPLOY }}
           SLACK_COLOR: danger
-          SLACK_MESSAGE: "Neon Lens Frontend deployment FAILED. Commit: ${{ github.event.workflow_run.head_sha }}"
-          SLACK_FOOTER: "Neon-Lens (Frontend) - S3 + CloudFront Deployment"
+          SLACK_MESSAGE: |
+            Neon Lens Frontend deployment FAILED.
 
+            Environment: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+            Commit: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_FOOTER: "Neon-Lens (Frontend) - S3 + CloudFront Deployment"

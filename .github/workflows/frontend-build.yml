@@ -1,16 +1,27 @@
+
 name: FRONTEND BUILD
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Select frontend environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - pre
+          - prod
 
 env:
-  AWS_REGION: us-east-1
+  NODE_VERSION: 22
 
 concurrency:
-  group: frontend-build-${{ github.ref }}
+  group: frontend-build-${{ inputs.branch }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   # ============================================================
@@ -22,17 +33,53 @@ jobs:
     timeout-minutes: 15
 
     environment:
-      name: production
-
-    permissions:
-      contents: read
+      name: ${{ inputs.branch }}
 
     steps:
+      # ------------------------------------------------------------
+      # VALIDATE DEPLOYMENT BRANCH
+      # ------------------------------------------------------------
+      - name: Validate deployment branch
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+
+          case "$TARGET_BRANCH" in
+            dev|pre|prod)
+              echo "Building environment: $TARGET_BRANCH"
+              ;;
+            *)
+              echo "::error::Unsupported environment '$TARGET_BRANCH'. Use dev, pre, or prod."
+              exit 1
+              ;;
+          esac
+
       # ------------------------------------------------------------
       # CHECKOUT
       # ------------------------------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      # ------------------------------------------------------------
+      # RECORD CHECKED-OUT COMMIT
+      # ------------------------------------------------------------
+      - name: Record checked-out commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+
+          echo "sha=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+
+          echo "Selected environment: ${{ inputs.branch }}"
+          echo "Checked-out commit: $SOURCE_COMMIT"
 
       # ------------------------------------------------------------
       # SETUP NODE
@@ -40,7 +87,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       # ------------------------------------------------------------
@@ -48,23 +95,31 @@ jobs:
       # ------------------------------------------------------------
       - name: Install dependencies
         run: |
+          set -euo pipefail
           echo "Installing frontend dependencies..."
           npm ci
           echo ""
           echo "Dependencies installed successfully."
 
-     
       # ------------------------------------------------------------
       # BUILD
       # ------------------------------------------------------------
       - name: Build frontend
+        env:
+          TARGET_BRANCH: ${{ inputs.branch }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
         run: |
+          set -euo pipefail
+
           echo "=============================================="
           echo "Building Neon Lens Frontend"
           echo "=============================================="
-          echo "Commit: ${{ github.sha }}"
+          echo "Environment: $TARGET_BRANCH"
+          echo "Commit: $SOURCE_COMMIT"
           echo ""
+
           npm run build
+
           echo ""
           echo "Frontend build completed successfully."
 
@@ -73,6 +128,8 @@ jobs:
       # ------------------------------------------------------------
       - name: Verify build output
         run: |
+          set -euo pipefail
+
           echo "Checking build output..."
           test -f dist/index.html
           echo ""
@@ -87,7 +144,7 @@ jobs:
       - name: Upload frontend artifact
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-dist-${{ github.sha }}
+          name: frontend-dist-${{ steps.source.outputs.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
@@ -96,12 +153,20 @@ jobs:
       # BUILD SUMMARY
       # ------------------------------------------------------------
       - name: Build summary
+        if: always()
+        env:
+          TARGET_BRANCH: ${{ inputs.branch }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
         run: |
           echo "=============================================="
-          echo "Neon Lens Frontend Build Successful"
+          echo "Neon Lens Frontend Build Summary"
           echo "=============================================="
-          echo "Commit   : ${{ github.sha }}"
-          echo "Artifact : frontend-dist-${{ github.sha }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Environment: $TARGET_BRANCH"
+          echo "Commit: ${SOURCE_COMMIT:-Not checked out}"
+          echo "Status: ${{ job.status }}"
+          echo "Artifact: frontend-dist-${SOURCE_COMMIT:-unavailable}"
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=============================================="
 
       # ------------------------------------------------------------
@@ -118,8 +183,9 @@ jobs:
             ${{ job.status == 'success' && '✅ Neon Lens Frontend Build Successful' || '❌ Neon Lens Frontend Build Failed' }}
 
             Repository: ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
+            Environment: ${{ inputs.branch }}
+            Branch: ${{ inputs.branch }}
+            Commit: ${{ steps.source.outputs.sha || 'Not checked out' }}
             Author: ${{ github.actor }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SLACK_FOOTER: "Neon-Lens Frontend CI"
