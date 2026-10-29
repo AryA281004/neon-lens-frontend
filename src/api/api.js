@@ -1,7 +1,6 @@
 import axios from "axios";
 
-const API_BASE_URL =
-  import.meta.env.BACKEND_URL || "https://api.aryandudhat.qd.je/api";
+const API_BASE_URL = "https://api.aryandudhat.qd.je/api";
 
 // 🔐 Create axios instance with interceptors
 const apiClient = axios.create({
