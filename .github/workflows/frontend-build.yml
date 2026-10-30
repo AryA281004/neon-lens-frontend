@@ -157,6 +157,7 @@ jobs:
         env:
           TARGET_BRANCH: ${{ inputs.branch }}
           SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
+          VITE_API_BASE_URL: ${{ inputs.branch == 'dev' && 'https://dev-api.aryandudhat.qd.je/api' || inputs.branch == 'pre' && 'https://pre-api.aryandudhat.qd.je/api' || 'https://api.aryandudhat.qd.je/api' }}
         shell: bash
         run: |
           set -euo pipefail
